@@ -1,0 +1,596 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h> 
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+#include <Adafruit_NeoPixel.h>
+#include <HTTPClient.h>
+#include "time.h"
+
+// --- Hardware Pins ---
+#define LED_PIN         15  
+#define MOSFET_PIN       4  
+#define LDR_PIN         34  
+#define NUM_PIXELS       4  
+
+Adafruit_NeoPixel strip(NUM_PIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_INA219 ina219;
+
+// --- Wi-Fi Credentials ---
+const char* ssid     = "evelyn";
+const char* password = "0135790022"; 
+
+// --- BACKEND URL (FASTAPI) ---
+const char* backendURL = "https://xm-um-backend.onrender.com/sensor";
+
+WebServer server(80); 
+
+// --- NTP Settings (Malaysia GMT+8) ---
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 28800; 
+const int   daylightOffset_sec = 0;
+
+// --- System Thresholds (mA) ---
+float sig_Aircond = 10.0; 
+float sig_Tv      = 2.6;  
+float sig_Fridge  = 4.0; 
+float sig_Light   = 2.0;  
+
+float tolerance = 2.0;  
+float noiseFloor = 1.5; 
+float peakLimit = 13.0;   
+
+// --- Appliance State Flags ---
+bool isAircondOn = false;
+bool isTvOn      = false;
+bool isFridgeOn  = false;
+bool isLightOn   = false; 
+bool isMosfetOn  = true; 
+bool isOverloaded = false; 
+
+float current_mA = 0.0;
+float previousCurrent = 0.0;
+unsigned long lastBlinkTime = 0;
+bool blinkState = false;
+
+// --- TIMERS ---
+unsigned long lastBillingTime = 0;
+
+// --- MULTI-CORE GLOBALS (For Cloud Task) ---
+volatile float cloud_voltage = 0.0;
+volatile float cloud_current = 0.0;
+TaskHandle_t CloudTask;
+
+// --- ⏱️ BILLING ENGINE VARIABLES ---
+const float TNB_RATE_RM = 0.218; 
+
+float fridge_v_hours = 0.0;
+float tv_v_hours     = 0.0;
+float ac_v_hours     = 0.0;
+float light_v_hours  = 0.0;
+
+float accumulated_fridge_cost = 0.0;
+float accumulated_tv_cost     = 0.0;
+float accumulated_ac_cost     = 0.0;
+float accumulated_light_cost  = 0.0;
+float total_accumulated_cost  = 0.0;
+
+float light_kW = 0.015; 
+
+// --- Helper function: ISO 8601 Timestamp ---
+String getISO8601Time() {
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    return "Waiting..."; 
+  }
+  char timeStringBuff[50];
+  strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%dT%H:%M:%S+08:00", &timeinfo);
+  return String(timeStringBuff);
+}
+
+// --- Helper function: Smooth Current ---
+float getSmoothedCurrent() {
+  float sum = 0;
+  for(int i = 0; i < 10; i++) {
+    sum += ina219.getCurrent_mA();
+    delay(5);
+  }
+  return sum / 10.0;
+}
+
+// --- Helper function: LED Control ---
+void setPanelColor(int r, int g, int b) {
+  for(int i = 0; i < NUM_PIXELS; i++) {
+    strip.setPixelColor(i, strip.Color(r, g, b));
+  }
+  strip.show();
+}
+
+// =========================================================
+// HTML: PAGE 1 - LIVE DASHBOARD
+// =========================================================
+const char* webDashboardHTML = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8"> 
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Smart Grid Node</title>
+    <style>
+        :root { --bg: #f4f7f6; --card: #ffffff; --text: #2c3e50; --accent: #2980b9; --danger: #e74c3c; --success: #27ae60;}
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: var(--bg); color: var(--text); text-align: center; margin: 0; padding: 0 20px 20px 20px; }
+        .navbar { background: white; padding: 15px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin: 0 -20px 20px -20px; display: flex; justify-content: center; gap: 20px; }
+        .nav-btn { text-decoration: none; font-weight: bold; padding: 10px 20px; border-radius: 8px; color: #7f8c8d; transition: 0.3s; }
+        .nav-active { background: var(--accent); color: white; }
+        h2 { color: var(--accent); margin-bottom: 20px; font-weight: 600;}
+        .grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; max-width: 800px; margin: 0 auto; }
+        .card { background: var(--card); padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); flex: 1; min-width: 250px; }
+        h3 { margin-top: 0; color: #7f8c8d; font-size: 1.1em; text-transform: uppercase; letter-spacing: 1px;}
+        .value { font-size: 2.8em; font-weight: bold; margin: 10px 0; color: var(--text); }
+        .status { font-weight: bold; padding: 8px 16px; border-radius: 20px; display: inline-block; width: 50px; text-align: center;}
+        .ON { background: #d4edda; color: #155724; }
+        .OFF { background: #f8d7da; color: #721c24; }
+        .app-row { display: flex; justify-content: space-between; align-items: center; padding: 15px 0; border-bottom: 1px solid #ecf0f1; font-size: 1.2em;}
+        .app-row:last-child { border-bottom: none; }
+        #warning { display: none; background: var(--danger); color: white; padding: 20px; border-radius: 8px; margin: 0 auto 20px auto; max-width: 800px; font-size: 1.2em; box-shadow: 0 4px 15px rgba(231, 76, 60, 0.4); animation: pulse 1s infinite alternate; }
+        @keyframes pulse { 0% { transform: scale(1); opacity: 1; } 100% { transform: scale(1.02); opacity: 0.9; } }
+        .btn-action { border: none; padding: 10px 20px; font-size: 1em; font-weight: bold; border-radius: 5px; cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2); margin-top: 10px;}
+        .btn-shutdown { background: white; color: var(--danger); }
+        .btn-restore { background: var(--success); color: white; display: none; }
+        .check-menu { display: none; background: #ffffff; color: var(--text); padding: 15px; border-radius: 8px; margin-top: 15px; text-align: left; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        .check-menu label { display: block; font-size: 1em; margin: 8px 0; cursor: pointer; }
+        .check-menu input[type="checkbox"] { transform: scale(1.3); margin-right: 10px; cursor: pointer;}
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <a href="/" class="nav-btn nav-active">🎛️ Live Dashboard</a>
+        <a href="/analysis" class="nav-btn">💰 Cost Analysis</a>
+    </div>
+
+    <div id="warning">
+        <div style="font-weight:bold;">⚠️ HIGH TARIFF ALERT: Energy consumption is too high! Reduce usage to lower your monthly bill.</div>
+        <div id="mosfet-prompt">
+            <p style="font-size: 0.9em; margin: 10px 0;">Should I close the external unused appliances to stabilize the grid?</p>
+            <button class="btn-action btn-shutdown" onclick="openApplianceMenu()">YES, SHUT OFF </button>
+        </div>
+        <div id="app-selection" class="check-menu">
+            <p style="margin-top:0; font-size: 0.9em; font-weight:bold; color: #e67e22;">🤖 Agentic AI Scan Complete: 4 non-essential loads detected.</p>
+            <p style="margin-top:5px; margin-bottom:10px; font-size: 0.85em; color: var(--text);">Select appliances to disconnect and stabilize the grid:</p>
+            <div style="margin-bottom:15px; border-top: 1px solid #ecf0f1; padding-top: 10px;">
+                <label><input type="checkbox" class="app-item"> Water Heater</label>
+                <label><input type="checkbox" class="app-item"> Cooker Hood</label>
+                <label><input type="checkbox" class="app-item"> Oven</label>
+                <label><input type="checkbox" class="app-item"> Kettle</label>
+                <label><input type="checkbox" id="selectAll" onclick="toggleAll(this)"> <b style="color:var(--accent);">Select All</b></label>
+            </div>
+            <button class="btn-action btn-shutdown" style="width:100%; background:#e74c3c; color:white;" onclick="confirmShutdown()">CONFIRM DISCONNECT</button>
+        </div>
+    </div>
+    
+    <h2>XM.UM Agentic Grid Node</h2>
+    <h2>Powered by NILM & Sensor Fusion</h2>
+    <div class="grid">
+        <div class="card">
+            <h3>Live Current</h3>
+            <div class="value" id="current">0.00 <span style="font-size:0.5em; color:#7f8c8d;">mA</span></div>
+        </div>
+        <div class="card">
+            <h3>Total Power</h3>
+            <div class="value" id="power">0.00 <span style="font-size:0.5em; color:#7f8c8d;">mW</span></div>
+        </div>
+    </div>
+
+    <div class="card" style="max-width: 800px; margin: 20px auto; text-align:left;">
+        <h3 style="text-align:center; margin-bottom: 20px;">Appliance Registries</h3>
+        <div class="app-row"><span>❄️ Air Conditioner</span> <span id="aircond" class="status OFF">OFF</span></div>
+        <div class="app-row"><span>📺 Television</span> <span id="tv" class="status OFF">OFF</span></div>
+        <div class="app-row"><span>🧊 Refrigerator</span> <span id="fridge" class="status OFF">OFF</span></div>
+        <div class="app-row"><span>💡 Smart Light (Digital LDR)</span> <span id="light" class="status OFF">OFF</span></div>
+        <div class="app-row" style="background:#f4f7f6; padding:15px; border-radius:8px; margin-top:10px; align-items:flex-start;">
+            <div style="display:flex; flex-direction:column;">
+                <span>🔌 Unused appliances (External Hub)</span>
+                <button id="btn-restore" class="btn-action btn-restore" onclick="fetch('/restoreMosfet')">🔄 TURN BACK ON</button>
+            </div>
+            <span id="mosfet" class="status ON">ON</span>
+        </div>
+    </div>
+
+    <script>
+        let isInteracting = false;
+        function openApplianceMenu() {
+            isInteracting = true;
+            document.getElementById('mosfet-prompt').style.display = 'none';
+            document.getElementById('app-selection').style.display = 'block';
+        }
+        function toggleAll(source) {
+            let items = document.querySelectorAll('.app-item');
+            items.forEach(item => item.checked = source.checked);
+        }
+        function confirmShutdown() {
+            fetch('/shutdownMosfet').then(() => {
+                isInteracting = false;
+                document.getElementById('app-selection').style.display = 'none';
+                document.getElementById('selectAll').checked = false;
+                document.querySelectorAll('.app-item').forEach(item => item.checked = false);
+            });
+        }
+        setInterval(function(){
+            fetch('/data')
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('current').innerHTML = data.current + ' <span style="font-size:0.5em; color:#7f8c8d;">mA</span>';
+                document.getElementById('power').innerHTML = data.power + ' <span style="font-size:0.5em; color:#7f8c8d;">mW</span>';
+                ['aircond', 'tv', 'fridge', 'light', 'mosfet'].forEach(app => {
+                    let el = document.getElementById(app);
+                    if(el) { el.innerText = data[app]; el.className = 'status ' + data[app]; }
+                });
+                document.getElementById('warning').style.display = (data.overload == 1) ? 'block' : 'none';
+                if (!isInteracting) {
+                    document.getElementById('mosfet-prompt').style.display = (data.mosfet === 'ON') ? 'block' : 'none';
+                }
+                document.getElementById('btn-restore').style.display = (data.mosfet === 'OFF') ? 'inline-block' : 'none';
+            })
+            .catch(err => console.log(err));
+        }, 500);
+    </script>
+</body>
+</html>
+)HTML";
+
+// =========================================================
+// HTML: PAGE 2 - COST ANALYSIS 
+// =========================================================
+const char* webAnalysisHTML = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8"> 
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Financial Analysis</title>
+    <style>
+        :root { --bg: #f4f7f6; --card: #ffffff; --text: #2c3e50; --accent: #2980b9; --danger: #e74c3c; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: var(--bg); color: var(--text); text-align: center; margin: 0; padding: 0 20px 20px 20px; }
+        .navbar { background: white; padding: 15px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin: 0 -20px 20px -20px; display: flex; justify-content: center; gap: 20px; }
+        .nav-btn { text-decoration: none; font-weight: bold; padding: 10px 20px; border-radius: 8px; color: #7f8c8d; transition: 0.3s; }
+        .nav-active { background: var(--accent); color: white; }
+        .card { background: var(--card); padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); max-width: 800px; margin: 0 auto 20px auto; text-align: left; }
+        h2 { color: var(--accent); text-align:center; margin-bottom: 5px;}
+        .subtitle { text-align:center; color: #7f8c8d; margin-top: 0; margin-bottom: 25px; line-height: 1.5;}
+        .timer-badge { color: #f39c12; font-weight: bold; font-size: 0.75em; margin-left: 8px; font-family: monospace; background: #fff8e1; padding: 2px 6px; border-radius: 4px; border: 1px solid #fdebd0;}
+        .bill-row { display: flex; justify-content: space-between; align-items: center; padding: 15px 0; border-bottom: 1px dashed #bdc3c7; font-size: 1.2em;}
+        .cost { font-weight: bold; color: #c0392b; width: 140px; text-align: right; font-family: monospace; font-size: 1.1em;}
+        .kw-label { font-size: 0.8em; color: #7f8c8d; width: 90px; text-align: right;}
+        .total-row { display: flex; justify-content: space-between; align-items: center; padding: 20px 0 5px 0; font-size: 1.6em; font-weight: bold; color: #2c3e50; margin-top: 10px;}
+        .total-cost { color: #27ae60; font-family: monospace;}
+        .btn-reset { background: var(--danger); color: white; border: none; padding: 6px 12px; font-size: 0.45em; font-weight: bold; border-radius: 5px; cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2); margin-top: 5px; letter-spacing: 0.5px;}
+        .formula-title { color: var(--accent); font-weight: bold; font-size: 1.1em; text-transform: uppercase; border-bottom: 2px solid #ecf0f1; padding-bottom: 8px; margin-bottom: 12px;}
+        .formula-box { background: #f8f9fa; border-left: 4px solid var(--accent); padding: 12px; font-family: monospace; font-size: 0.95em; color: #34495e; margin: 10px 0; overflow-x: auto;}
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <a href="/" class="nav-btn">🎛️ Live Dashboard</a>
+        <a href="/analysis" class="nav-btn nav-active">💰 Cost Analysis</a>
+    </div>
+
+    <h2>Live Accumulated Electric Bill</h2>
+    <div class="subtitle">Simulation Speed: <b>1 Real Second = 1 Virtual Hour</b></div>
+
+    <div class="card">
+        <div class="bill-row">
+            <span>❄️ Air Conditioner <span class="timer-badge">⏱️ <span id="ac-hrs">0</span> hrs</span></span>
+            <span class="kw-label" id="ac-kw">0.00 kW</span>
+            <span class="cost">RM <span id="ac-cost">0.0000</span></span>
+        </div>
+        <div class="bill-row">
+            <span>📺 Television <span class="timer-badge">⏱️ <span id="tv-hrs">0</span> hrs</span></span>
+            <span class="kw-label" id="tv-kw">0.00 kW</span>
+            <span class="cost">RM <span id="tv-cost">0.0000</span></span>
+        </div>
+        <div class="bill-row">
+            <span>🧊 Refrigerator <span class="timer-badge">⏱️ <span id="fridge-hrs">0</span> hrs</span></span>
+            <span class="kw-label" id="fridge-kw">0.00 kW</span>
+            <span class="cost">RM <span id="fridge-cost">0.0000</span></span>
+        </div>
+        <div class="bill-row">
+            <span>💡 Smart Light <span class="timer-badge">⏱️ <span id="light-hrs">0</span> hrs</span></span>
+            <span class="kw-label" id="light-kw">0.00 kW</span>
+            <span class="cost">RM <span id="light-cost">0.0000</span></span>
+        </div>
+        <div class="total-row">
+            <div style="display:flex; flex-direction:column; align-items:flex-start;">
+                <span>TOTAL BILL:</span>
+                <button class="btn-reset" onclick="fetch('/resetBill')">🗑️ RESET DATA</button>
+            </div>
+            <span class="total-cost">RM <span id="total-cost">0.0000</span></span>
+        </div>
+    </div>
+
+    <div class="card" style="background: #fafbfc; border: 1px solid #e1e8ed;">
+        <div class="formula-title">📋 Simulation Math & Conversion Formulas</div>
+        <p style="margin: 5px 0; font-size: 0.95em;"><b>1. Scale Factor (Hardware to Real-World Model):</b></p>
+        <div class="formula-box">Real Power (kW) = Hardware Current (mA) &times; 0.1</div>
+        <p style="margin: 15px 0 5px 0; font-size: 0.95em;"><b>2. Energy Calculation (Per Appliance Loop):</b></p>
+        <div class="formula-box">Energy Consumed (kWh) = Real Power (kW) &times; Accumulated Hours (hrs)</div>
+        <p style="margin: 15px 0 5px 0; font-size: 0.95em;"><b>3. Cost Generation (TNB Residential Tariff Tier 1):</b></p>
+        <div class="formula-box">Appliance Cost (RM) = Energy Consumed (kWh) &times; RM 0.218 / kWh</div>
+    </div>
+
+    <script>
+        setInterval(function(){
+            fetch('/data')
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('ac-hrs').innerText = data.ac_hrs;
+                document.getElementById('ac-kw').innerText = data.ac_kw + " kW";
+                document.getElementById('ac-cost').innerText = data.ac_fee;
+                document.getElementById('tv-hrs').innerText = data.tv_hrs;
+                document.getElementById('tv-kw').innerText = data.tv_kw + " kW";
+                document.getElementById('tv-cost').innerText = data.tv_fee;
+                document.getElementById('fridge-hrs').innerText = data.fridge_hrs;
+                document.getElementById('fridge-kw').innerText = data.fridge_kw + " kW";
+                document.getElementById('fridge-cost').innerText = data.fridge_fee;
+                document.getElementById('light-hrs').innerText = data.light_hrs;
+                document.getElementById('light-kw').innerText = data.light_kw + " kW";
+                document.getElementById('light-cost').innerText = data.light_fee;
+                document.getElementById('total-cost').innerText = data.total_fee;
+            });
+        }, 500); 
+    </script>
+</body>
+</html>
+)HTML";
+
+// =========================================================
+// HANDLERS & ROUTING INTERFACES
+// =========================================================
+void handleRoot() { server.send(200, "text/html", webDashboardHTML); }
+void handleAnalysis() { server.send(200, "text/html", webAnalysisHTML); }
+void handleShutdownMosfet() { isMosfetOn = false; isOverloaded = false; digitalWrite(MOSFET_PIN, LOW); server.send(200, "text/plain", "Mosfet Shut Down"); }
+void handleRestoreMosfet() { isMosfetOn = true; isOverloaded = false; digitalWrite(MOSFET_PIN, HIGH); server.send(200, "text/plain", "Mosfet Restored"); }
+
+void handleResetBill() {
+  fridge_v_hours = 0.0;
+  tv_v_hours = 0.0;
+  ac_v_hours = 0.0;
+  light_v_hours = 0.0;
+  accumulated_fridge_cost = 0.0;
+  accumulated_tv_cost = 0.0;
+  accumulated_ac_cost = 0.0;
+  accumulated_light_cost = 0.0;
+  total_accumulated_cost = 0.0;
+  isOverloaded = false; 
+  server.send(200, "text/plain", "Bill Wiped Successfully");
+}
+
+void handleData() {
+  float power_mW = cloud_voltage * cloud_current;
+  
+  if (cloud_current >= peakLimit) { isOverloaded = true; }
+  int isOverload = isOverloaded ? 1 : 0; 
+  
+  float fridge_kW = isFridgeOn ? (sig_Fridge * 0.1) : 0.0;
+  float tv_kW     = isTvOn ? (sig_Tv * 0.1) : 0.0;
+  
+  float leftover_mA = cloud_current - (isFridgeOn ? sig_Fridge : 0.0) - (isTvOn ? sig_Tv : 0.0) - (isLightOn ? sig_Light : 0.0);
+  float ac_kW = (isAircondOn && leftover_mA > 2.5) ? (leftover_mA * 0.1) : 0.0;
+
+  String json = "{";
+  json += "\"current\":" + String(cloud_current, 1) + ",";
+  json += "\"power\":" + String(power_mW, 1) + ",";
+  json += "\"overload\":" + String(isOverload) + ",";
+  
+  json += "\"aircond\":\"" + String(isAircondOn ? "ON" : "OFF") + "\",";
+  json += "\"tv\":\"" + String(isTvOn ? "ON" : "OFF") + "\",";
+  json += "\"fridge\":\"" + String(isFridgeOn ? "ON" : "OFF") + "\",";
+  json += "\"light\":\"" + String(isLightOn ? "ON" : "OFF") + "\",";
+  json += "\"mosfet\":\"" + String(isMosfetOn ? "ON" : "OFF") + "\",";
+  
+  json += "\"fridge_hrs\":\"" + String(fridge_v_hours, 0) + "\",";
+  json += "\"tv_hrs\":\"" + String(tv_v_hours, 0) + "\",";
+  json += "\"ac_hrs\":\"" + String(ac_v_hours, 0) + "\",";
+  json += "\"light_hrs\":\"" + String(light_v_hours, 0) + "\",";
+
+  json += "\"fridge_kw\":\"" + String(fridge_kW, 2) + "\",";
+  json += "\"fridge_fee\":\"" + String(accumulated_fridge_cost, 4) + "\",";
+  json += "\"tv_kw\":\"" + String(tv_kW, 2) + "\",";
+  json += "\"tv_fee\":\"" + String(accumulated_tv_cost, 4) + "\",";
+  json += "\"ac_kw\":\"" + String(ac_kW, 2) + "\",";
+  json += "\"ac_fee\":\"" + String(accumulated_ac_cost, 4) + "\",";
+  json += "\"light_kw\":\"" + String(light_kW, 3) + "\",";
+  json += "\"light_fee\":\"" + String(accumulated_light_cost, 4) + "\",";
+  json += "\"total_fee\":\"" + String(total_accumulated_cost, 4) + "\"";
+  
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// =========================================================
+// PARALLEL TASK: HTTPS CLOUD SYNC (RUNS ON CORE 0)
+// =========================================================
+void cloudSyncTask(void * parameter) {
+  for(;;) {
+    // Wait exactly 2 seconds between cloud updates
+    vTaskDelay(2000 / portTICK_PERIOD_MS); 
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      WiFiClientSecure *client = new WiFiClientSecure;
+      client->setInsecure(); 
+
+      HTTPClient http;
+      http.begin(*client, backendURL);
+      http.addHeader("Content-Type", "application/json");
+
+      float c_A = cloud_current / 1000.0;
+      float p_W = cloud_voltage * c_A;
+
+      String json = "{";
+      json += "\"timestamp\":\"" + getISO8601Time() + "\",";
+      json += "\"power\":" + String(p_W, 3) + ",";
+      json += "\"voltage\":" + String(cloud_voltage, 2) + ",";
+      json += "\"current\":" + String(c_A, 4);
+      json += "}";
+
+      int code = http.POST(json);
+      Serial.print("[Core 0] Cloud Sync Status: ");
+      Serial.println(code);
+
+      http.end();
+      delete client; 
+    }
+  }
+}
+
+// =========================================================
+// SETUP
+// =========================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(MOSFET_PIN, OUTPUT);
+  digitalWrite(MOSFET_PIN, HIGH);
+  isMosfetOn = true;
+
+  pinMode(LDR_PIN, INPUT); 
+
+  strip.begin();
+  setPanelColor(40, 40, 40);
+
+  if (!ina219.begin()) {
+    Serial.println("INA219 ERROR");
+    while (1);
+  }
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Connected!");
+  Serial.print("🌐 Local Web UI URL: http://");
+  Serial.println(WiFi.localIP());
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  server.on("/", handleRoot);
+  server.on("/analysis", handleAnalysis);
+  server.on("/data", handleData);
+  server.on("/shutdownMosfet", handleShutdownMosfet);
+  server.on("/restoreMosfet", handleRestoreMosfet);
+  server.on("/resetBill", handleResetBill);
+
+  server.begin();
+  previousCurrent = getSmoothedCurrent();
+  lastBillingTime = millis();
+
+  // --- START THE DUAL-CORE CLOUD TASK ---
+  xTaskCreatePinnedToCore(
+    cloudSyncTask,   // Function to run
+    "CloudTask",     // Name of task
+    10000,           // Stack size (HTTPS needs memory)
+    NULL,            // Parameters
+    1,               // Priority
+    &CloudTask,      // Task Handle
+    0                // Pin to Core 0 (Main loop runs on Core 1)
+  );
+  Serial.println("Dual-Core Processing Activated.");
+}
+
+// =========================================================
+// LOOP (RUNS ON CORE 1 - LIGHTNING FAST)
+// =========================================================
+void loop() {
+  server.handleClient(); // Answers the tablet instantly now!
+
+  int lightState = digitalRead(LDR_PIN);
+  isLightOn = (lightState == LOW); // Switch to HIGH if logic is inverted
+
+  current_mA = getSmoothedCurrent();
+  float voltage_V = ina219.getBusVoltage_V();
+
+  // Share latest sensor data with Core 0 safely
+  cloud_current = current_mA;
+  cloud_voltage = voltage_V;
+
+  // --- Real-Time Billing ---
+  if (millis() - lastBillingTime >= 1000) {
+    lastBillingTime = millis();
+    
+    if (isFridgeOn) {
+      fridge_v_hours += 1.0;
+      accumulated_fridge_cost += ((sig_Fridge * 0.1) * 1.0 * TNB_RATE_RM);
+    }
+    if (isTvOn) {
+      tv_v_hours += 1.0;
+      accumulated_tv_cost += ((sig_Tv * 0.1) * 1.0 * TNB_RATE_RM);
+    }
+    if (isLightOn) {
+      light_v_hours += 1.0;
+      accumulated_light_cost += (light_kW * 1.0 * TNB_RATE_RM);
+    }
+    
+    float l_mA = current_mA - (isFridgeOn ? sig_Fridge : 0.0) - (isTvOn ? sig_Tv : 0.0) - (isLightOn ? sig_Light : 0.0);
+    if (isAircondOn && l_mA > 2.5) { 
+      ac_v_hours += 1.0;
+      accumulated_ac_cost += ((l_mA * 0.1) * 1.0 * TNB_RATE_RM);
+    }
+    total_accumulated_cost = accumulated_fridge_cost + accumulated_tv_cost + accumulated_ac_cost + accumulated_light_cost;
+  }
+
+  // --- NILM Calculation States ---
+  float currentDifference = current_mA - previousCurrent;
+
+  if (current_mA < 1.0) {
+    isAircondOn = false;
+    isTvOn = false;
+    isFridgeOn = false;
+  }
+
+  if (currentDifference > noiseFloor) {
+    if (abs(currentDifference - sig_Fridge) <= tolerance) isFridgeOn = true;
+    else if (abs(currentDifference - sig_Tv) <= tolerance) isTvOn = true;
+    previousCurrent = current_mA;
+    delay(200); // Reduced delay to keep web server fast
+  }
+  else if (currentDifference < -noiseFloor) {
+    float drop = abs(currentDifference);
+    if (abs(drop - sig_Fridge) <= tolerance) isFridgeOn = false;
+    else if (abs(drop - sig_Tv) <= tolerance) isTvOn = false;
+    previousCurrent = current_mA;
+    delay(200); 
+  }
+  else {
+    previousCurrent = (current_mA * 0.05) + (previousCurrent * 0.95);
+  }
+
+  float expectedFixedLoad = 0.0;
+  if (isFridgeOn) expectedFixedLoad += sig_Fridge;
+  if (isTvOn) expectedFixedLoad += sig_Tv;
+  if (isLightOn) expectedFixedLoad += sig_Light; 
+
+  float leftoverVariableCurrent = current_mA - expectedFixedLoad;
+  isAircondOn = (leftoverVariableCurrent > 2.5);
+
+  // --- NeoPixel LED ---
+  int activeCount = 0;
+  if (isFridgeOn) activeCount++;
+  if (isTvOn) activeCount++;
+  if (isAircondOn) activeCount++;
+
+  if (current_mA >= peakLimit) {
+    if (millis() - lastBlinkTime > 200) {
+      lastBlinkTime = millis();
+      blinkState = !blinkState;
+      setPanelColor(blinkState ? 255 : 0, 0, 0);
+    }
+  }
+  else if (activeCount >= 2) setPanelColor(0, 0, 255);
+  else if (activeCount == 1) setPanelColor(0, 255, 0);
+  else setPanelColor(40, 40, 40);
+
+  delay(10);
+}
